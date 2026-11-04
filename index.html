@@ -976,7 +976,7 @@ footer{padding:0 24px 32px;position:relative;z-index:1}
         </div>
         <div class="footer-note">
           Juego independiente inspirado en el teléfono roto.<br>
-          Multijugador con WebRTC · Sin anuncios · Sin registro.
+          Multijugador online · Sin anuncios · Sin registro · v3
         </div>
       </div>
     </footer>
@@ -1003,23 +1003,44 @@ footer{padding:0 24px 32px;position:relative;z-index:1}
     </div>
     <button class="btn btn-primary btn-full btn-lg" id="modalSubmit">Crear sala →</button>
     <div class="modal-switch" id="modalSwitch">¿Tienes un código? <button type="button" id="switchMode">Unirme a una sala</button></div>
-    <div class="modal-foot">🔒 Juego P2P: las partidas van directas entre jugadores.</div>
+    <div class="modal-foot">🔒 Versión 3 · si no entra, recargad ambos con Ctrl+F5 y comprobad que pone v3.</div>
   </div>
 </div>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <div class="fx" id="fx" aria-hidden="true"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 /* ============================================================
-   GARABATO — app
-   Recreación del teléfono roto dibujado.
-   Multijugador P2P con PeerJS + WebRTC. Sin backend.
+   GARABATO — app  (build 3)
+   El teléfono roto dibujado.
+   Online: relay MQTT (atraviesa NAT) y, si falla, WebRTC + TURN.
    ============================================================ */
 'use strict';
 
-const ROOM_PREFIX = 'garabato-v2-';
+const BUILD = '3';
+const PEER_PREFIX = 'garabatov3';
+const BROKERS = [
+  { url: 'wss://broker.emqx.io:8084/mqtt', chunk: 14000, name: 'emqx' },
+  { url: 'wss://broker.hivemq.com:8884/mqtt', chunk: 3200, name: 'hivemq' }
+];
+const PEER_OPTIONS = {
+  debug: 0,
+  secure: true,
+  config: {
+    sdpSemantics: 'unified-plan',
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+    ]
+  }
+};
 const MAX_PLAYERS = 8;
 const MIN_PLAYERS = 2;
 const AVATARS = ['🦊','🐙','🐸','🦄','🐼','🐯','🐨','🦉','🐳','🦖','🐝','🐹','🦩','🐢','🦜','🐰'];
@@ -1343,9 +1364,14 @@ function closeModal () {
   $('#joinModal').classList.remove('open');
   if (APP.joining) {
     APP.joining = false;
-    $('#modalSubmit').disabled = false;
-    $('#modalSubmit').textContent = 'Entrar en la sala →';
-    if (APP.peer) { try { APP.peer.destroy(); } catch (e) {} APP.peer = null; }
+    APP.joinToken = null;
+    clearTimeout(APP.helloTimer);
+    const btn = $('#modalSubmit');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Entrar en la sala →';
+    }
+    stopNet(true);
     APP.mode = null;
     APP.me = null;
   }
@@ -1403,15 +1429,187 @@ function startDemo () {
 }
 
 /* ------------------------------------------------------------
-   ROOM: host
+   RED — MQTT (principal) + PeerJS/TURN (reserva)
 ------------------------------------------------------------ */
+function mqttApi () {
+  const lib = window.mqtt;
+  if (lib && typeof lib.connect === 'function') return lib;
+  if (typeof lib === 'function') return { connect: lib };
+  return null;
+}
+function ensureMqtt (done) {
+  if (mqttApi()) { done(true); return; }
+  const waiters = APP.mqttWaiters || (APP.mqttWaiters = []);
+  waiters.push(done);
+  if (APP.mqttLoading) return;
+  APP.mqttLoading = true;
+  const s = document.createElement('script');
+  s.src = 'https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js';
+  s.onload = () => {
+    APP.mqttLoading = false;
+    const ok = !!mqttApi();
+    const list = APP.mqttWaiters || [];
+    APP.mqttWaiters = [];
+    list.forEach(fn => fn(ok));
+  };
+  s.onerror = () => {
+    APP.mqttLoading = false;
+    const list = APP.mqttWaiters || [];
+    APP.mqttWaiters = [];
+    list.forEach(fn => fn(false));
+  };
+  document.head.appendChild(s);
+}
+function roomTopic (code, ...parts) {
+  return ['garabato', 'v3', String(code || '').toUpperCase(), ...parts].join('/');
+}
+function bytesToText (message) {
+  if (message == null) return '';
+  if (typeof message === 'string') return message;
+  try { return new TextDecoder('utf-8').decode(message); } catch (e) {}
+  try { return String(message); } catch (e) { return ''; }
+}
+function ingestRaw (raw, handler) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch (e) { return; }
+  if (!msg || typeof msg !== 'object') return;
+  if (msg.t === '_chunk' && typeof msg.d === 'string' && msg.n > 0 && msg.n < 500 && msg.i >= 0) {
+    const bags = APP.chunkBags || (APP.chunkBags = new Map());
+    const now = Date.now();
+    bags.forEach((bag, key) => { if (now - bag.ts > 25000) bags.delete(key); });
+    let bag = bags.get(msg.id);
+    if (!bag) {
+      bag = { n: msg.n, parts: new Array(msg.n), got: 0, ts: now };
+      bags.set(msg.id, bag);
+    }
+    if (bag.parts[msg.i] == null) {
+      bag.parts[msg.i] = msg.d;
+      bag.got++;
+    }
+    if (bag.got === bag.n && bag.parts.every(part => typeof part === 'string')) {
+      bags.delete(msg.id);
+      try { handler(JSON.parse(bag.parts.join(''))); } catch (e) { console.warn('chunk', e); }
+    }
+    return;
+  }
+  handler(msg);
+}
+function enqueuePublish (topicName, payload, opts) {
+  APP.outbox = APP.outbox || [];
+  APP.outbox.push({ topic: topicName, payload, opts: opts || { qos: 0 } });
+  pumpOutbox();
+}
+function pumpOutbox () {
+  if (APP.pumpTimer) return;
+  if (!APP.mqtt || !APP.mqtt.connected || !APP.outbox || !APP.outbox.length) return;
+  const item = APP.outbox.shift();
+  try { APP.mqtt.publish(item.topic, item.payload, item.opts); } catch (e) { console.warn('publish', e); }
+  if (APP.outbox.length) {
+    APP.pumpTimer = setTimeout(() => { APP.pumpTimer = null; pumpOutbox(); }, 45);
+  }
+}
+function flushNow () {
+  clearTimeout(APP.pumpTimer);
+  APP.pumpTimer = null;
+  if (!APP.mqtt || !APP.mqtt.connected || !APP.outbox) return;
+  const items = APP.outbox.splice(0);
+  items.forEach(item => {
+    try { APP.mqtt.publish(item.topic, item.payload, item.opts); } catch (e) {}
+  });
+}
+function publishJson (topicName, obj, opts) {
+  if (!topicName) return;
+  let raw = '';
+  try { raw = JSON.stringify(obj); } catch (e) { return; }
+  const chunk = (APP.broker && APP.broker.chunk) || 8000;
+  const options = Object.assign({ qos: 0 }, opts || {});
+  if (raw.length <= chunk) {
+    enqueuePublish(topicName, raw, options);
+    return;
+  }
+  const id = 'k' + uid().replace(/[^a-z0-9]/gi, '');
+  const n = Math.ceil(raw.length / chunk);
+  for (let i = 0; i < n; i++) {
+    enqueuePublish(topicName, JSON.stringify({
+      t: '_chunk', id, i, n, d: raw.slice(i * chunk, (i + 1) * chunk)
+    }), { qos: 0 });
+  }
+}
+function publishPresence (online) {
+  if (!APP.mqtt || !APP.roomCode || !APP.me) return;
+  const payload = JSON.stringify({
+    t: 'presence',
+    online: !!online,
+    hostId: APP.me.id,
+    code: APP.roomCode,
+    ts: Date.now()
+  });
+  try {
+    APP.mqtt.publish(roomTopic(APP.roomCode, 'host'), payload, { qos: 1, retain: true });
+  } catch (e) {}
+}
+function openBroker (broker, clientId, will) {
+  const lib = mqttApi();
+  if (!lib || !broker) return null;
+  try {
+    return lib.connect(broker.url, {
+      clientId: String(clientId).slice(0, 48),
+      clean: true,
+      reconnectPeriod: 2000,
+      connectTimeout: 7000,
+      protocolVersion: 4,
+      keepalive: 25,
+      will: will || undefined
+    });
+  } catch (e) {
+    console.warn(e);
+    return null;
+  }
+}
+function stopSocket (socket, force) {
+  if (!socket) return;
+  try {
+    if (typeof socket.end === 'function') socket.end(!!force);
+    else if (typeof socket.destroy === 'function') socket.destroy();
+  } catch (e) {}
+}
+function stopNet (force) {
+  clearTimeout(APP.brokerTimer);
+  clearTimeout(APP.helloTimer);
+  clearTimeout(APP.pumpTimer);
+  APP.brokerTimer = null;
+  APP.helloTimer = null;
+  APP.pumpTimer = null;
+  APP.outbox = [];
+  const mqtt = APP.mqtt;
+  const peer = APP.peer;
+  APP.mqtt = null;
+  APP.peer = null;
+  APP.hostConn = null;
+  APP.transport = null;
+  APP.broker = null;
+  stopSocket(mqtt, force !== false);
+  stopSocket(peer, true);
+  APP.conns.clear();
+}
+function switchHostId (newId) {
+  if (!APP.me || !APP.engine || APP.me.id === newId) return;
+  const oldId = APP.me.id;
+  APP.me.id = newId;
+  APP.engine.hostId = newId;
+  APP.engine.players.forEach(p => { if (p.id === oldId) p.id = newId; });
+  APP.engine.books.forEach(b => { if (b.authorId === oldId) b.authorId = newId; });
+  if (APP.state) APP.state.hostId = newId;
+  if (APP.screen === 'lobby') renderLobby();
+}
+
 function createHostRoom (name, options) {
   const opts = options || {};
   APP.mode = 'host';
-  const code = cleanText(opts.code || makeCode(), 6).toUpperCase() || makeCode();
-  const myId = ROOM_PREFIX + code;
+  const code = (cleanText(opts.code || makeCode(), 6).toUpperCase() || makeCode()).replace(/[^A-Z0-9]/g, '').slice(0, 5);
+  APP.roomCode = code;
   APP.me = {
-    id: myId,
+    id: 'host' + code,
     name: name || 'Invitado',
     avatar: APP.selectedAvatar || savedAvatar() || pick(AVATARS),
     isHost: true
@@ -1419,17 +1617,25 @@ function createHostRoom (name, options) {
   APP.revealBooks = null;
   APP.inviteCode = code;
   APP.hostRetried = false;
+  APP.transport = null;
+  APP.outbox = [];
+  APP.onlineAnnounced = false;
   APP.engine = createEngine(code);
   if (opts.bots) {
     const count = clamp(Number(opts.bots) || 0, 0, 3);
     for (let i = 0; i < count; i++) addBotToLobby();
   }
   renderLobby();
-  connectHostPeer();
+  beginHostOnline();
 }
 
 function hostSend (playerId, msg) {
-  if (APP.mode !== 'host') return false;
+  if (APP.mode !== 'host' || !playerId) return false;
+  if (APP.transport === 'mqtt') {
+    if (!APP.roomCode) return false;
+    publishJson(roomTopic(APP.roomCode, 'out', playerId), msg, { qos: 0 });
+    return !!APP.mqtt;
+  }
   const conn = APP.conns.get(playerId);
   if (!conn) return false;
   try { if (conn.open) { conn.send(msg); return true; } } catch (e) { console.warn('send error', e); }
@@ -1437,24 +1643,95 @@ function hostSend (playerId, msg) {
 }
 function broadcast (msg) {
   if (APP.mode !== 'host') return;
+  if (APP.transport === 'mqtt') {
+    if (APP.roomCode) publishJson(roomTopic(APP.roomCode, 'all'), msg, { qos: 0 });
+    return;
+  }
   APP.conns.forEach(conn => {
     try { if (conn.open) conn.send(msg); } catch (e) { console.warn('broadcast error', e); }
   });
 }
 
-function connectHostPeer () {
+function beginHostOnline () {
+  APP.netStatus = 'connecting';
+  updateNetNote();
+  ensureMqtt((ok) => {
+    if (APP.mode !== 'host') return;
+    if (!ok) { startPeerHost(); return; }
+    tryHostBroker(0);
+  });
+}
+function tryHostBroker (index) {
+  if (APP.mode !== 'host' || APP.transport === 'mqtt' || APP.transport === 'peer') return;
+  const broker = BROKERS[index];
+  if (!broker) { startPeerHost(); return; }
+  const client = openBroker(broker, 'gh' + APP.roomCode + Math.random().toString(36).slice(2, 8), {
+    topic: roomTopic(APP.roomCode, 'host'),
+    payload: JSON.stringify({ t: 'presence', online: false, hostId: APP.me && APP.me.id, code: APP.roomCode, ts: Date.now() }),
+    qos: 1,
+    retain: true
+  });
+  if (!client) { tryHostBroker(index + 1); return; }
+  let settled = false;
+  const giveUp = setTimeout(() => {
+    if (settled || APP.transport) return;
+    stopSocket(client, true);
+    tryHostBroker(index + 1);
+  }, 6000);
+  client.on('connect', () => {
+    if (APP.mode !== 'host' || APP.transport === 'peer' || (APP.transport === 'mqtt' && APP.mqtt && APP.mqtt !== client)) {
+      stopSocket(client, true);
+      return;
+    }
+    settled = true;
+    clearTimeout(giveUp);
+    APP.mqtt = client;
+    APP.broker = broker;
+    APP.transport = 'mqtt';
+    client.subscribe(roomTopic(APP.roomCode, 'in', '+'), { qos: 0 }, () => {
+      publishPresence(true);
+      APP.netStatus = 'online';
+      updateNetNote();
+      pumpOutbox();
+      if (!APP.onlineAnnounced) {
+        APP.onlineAnnounced = true;
+        toast('Sala online lista. Ya puedes compartir el código.', 2800);
+      }
+    });
+  });
+  client.on('message', (top, message) => {
+    if (APP.transport !== 'mqtt' || APP.mqtt !== client) return;
+    const pid = String(top || '').split('/').pop();
+    ingestRaw(bytesToText(message), (msg) => handleHostData(pid, msg));
+  });
+  client.on('reconnect', () => {
+    if (APP.mqtt !== client) return;
+    APP.netStatus = 'reconnecting';
+    updateNetNote();
+  });
+  client.on('error', (err) => console.warn('mqtt host', err && err.message ? err.message : err));
+  client.on('close', () => {
+    if (APP.mqtt === client && APP.mode === 'host') {
+      APP.netStatus = 'reconnecting';
+      updateNetNote();
+    }
+  });
+}
+function startPeerHost () {
+  if (APP.mode !== 'host' || APP.transport === 'mqtt') return;
   if (typeof Peer === 'undefined') {
     APP.netStatus = 'offline';
     updateNetNote();
-    toast('No se pudo cargar PeerJS: el modo online no está disponible. Puedes jugar con bots.', 5000);
+    toast('No se pudo abrir la sala online. Recarga la página (Ctrl+F5) o juega con bots.', 5200);
     return;
   }
-  if (APP.peer) { try { APP.peer.destroy(); } catch (e) {} }
-  APP.netStatus = 'connecting';
-  updateNetNote();
+  const peerId = PEER_PREFIX + APP.roomCode;
+  switchHostId(peerId);
   try {
-    const peer = new Peer(APP.me.id, PEER_OPTIONS);
+    if (APP.peer) stopSocket(APP.peer, true);
+    const peer = new Peer(peerId, PEER_OPTIONS);
     APP.peer = peer;
+    APP.transport = 'peer';
     peer.on('open', () => {
       APP.netStatus = 'online';
       updateNetNote();
@@ -1463,49 +1740,25 @@ function connectHostPeer () {
     peer.on('disconnected', () => {
       APP.netStatus = 'reconnecting';
       updateNetNote();
-      setTimeout(() => { try { if (APP.peer && !APP.peer.destroyed) APP.peer.reconnect(); } catch (e) {} }, 1800);
+      setTimeout(() => { try { if (APP.peer && !APP.peer.destroyed) APP.peer.reconnect(); } catch (e) {} }, 1500);
     });
     peer.on('error', (err) => {
-      console.warn('PeerJS host error:', err && err.type, err);
-      if (err && err.type === 'unavailable-id' && !APP.hostRetried) {
-        APP.hostRetried = true;
-        regenerateHostCode();
-        return;
-      }
-      if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err && err.type)) {
+      console.warn('PeerJS host', err && err.type, err);
+      if (['unavailable-id', 'invalid-id', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(err && err.type)) {
         APP.netStatus = 'offline';
         updateNetNote();
+        if (err.type === 'unavailable-id') toast('Ese código acaba de ocuparse. Sal y crea otra sala.', 4200);
       }
     });
   } catch (e) {
     console.warn(e);
     APP.netStatus = 'offline';
     updateNetNote();
-    toast('El modo online no está disponible ahora mismo. La partida con bots sigue funcionando.');
+    toast('El modo online no está disponible ahora mismo. Puedes jugar con bots.', 4200);
   }
 }
 
-function regenerateHostCode () {
-  if (!APP.engine) return;
-  const oldId = ROOM_PREFIX + APP.engine.code;
-  const newCode = makeCode();
-  const newId = ROOM_PREFIX + newCode;
-  APP.engine.code = newCode;
-  APP.engine.hostId = newId;
-  APP.me.id = newId;
-  APP.inviteCode = newCode;
-  updateHostPlayerId(oldId, newId);
-  connectHostPeer();
-  if (APP.screen === 'lobby') renderLobby();
-  toast('El código de sala se ha renovado para evitar una colisión. Comparte el nuevo.');
-  if (typeof broadcast === 'function' && APP.engine) APP.engine.emit();
-}
 
-function updateHostPlayerId (oldId, newId) {
-  if (!APP.engine) return;
-  APP.engine.players.forEach(p => { if (p.id === oldId) p.id = newId; });
-  APP.engine.books.forEach(b => { if (b.authorId === oldId) b.authorId = newId; });
-}
 
 function setupHostConnection (conn) {
   APP.conns.set(conn.peer, conn);
@@ -1517,20 +1770,25 @@ function setupHostConnection (conn) {
   conn.on('error', () => onPeerLeft(conn.peer));
 }
 
-function handleHostData (conn, data) {
+function replyTo (connOrId, msg) {
+  if (typeof connOrId === 'string') { hostSend(connOrId, msg); return; }
+  try { if (connOrId && connOrId.open) connOrId.send(msg); } catch (e) {}
+}
+function handleHostData (connOrId, data) {
   if (!data || typeof data !== 'object' || !APP.engine) return;
-  const pid = conn.peer;
+  const pid = typeof connOrId === 'string' ? connOrId : (connOrId && connOrId.peer);
+  if (!pid || pid === APP.me.id) return;
 
   if (data.t === 'hello') {
     if (APP.engine.stage !== 'lobby') {
-      try { conn.send({ t: 'denied', reason: 'La partida ya ha empezado. Pide al anfitrión que vuelva a la sala.' }); } catch (e) {}
-      setTimeout(() => { try { conn.close(); } catch (e) {} }, 400);
+      replyTo(connOrId, { t: 'denied', reason: 'La partida ya ha empezado. Pide al anfitrión que vuelva a la sala.' });
+      if (connOrId && connOrId.close) setTimeout(() => { try { connOrId.close(); } catch (e) {} }, 400);
       return;
     }
     const existing = APP.engine.players.find(p => p.id === pid);
     if (!existing && APP.engine.players.length >= MAX_PLAYERS) {
-      try { conn.send({ t: 'denied', reason: 'La sala está llena (8 artistas). Pide al anfitrión que abra otra.' }); } catch (e) {}
-      setTimeout(() => { try { conn.close(); } catch (e) {} }, 500);
+      replyTo(connOrId, { t: 'denied', reason: 'La sala está llena (8 artistas). Pide al anfitrión que abra otra.' });
+      if (connOrId && connOrId.close) setTimeout(() => { try { connOrId.close(); } catch (e) {} }, 500);
       return;
     }
     if (!existing) {
@@ -1542,9 +1800,20 @@ function handleHostData (conn, data) {
       });
     } else {
       existing.online = true;
+      existing._gone = false;
     }
-    try { conn.send({ t: 'welcome', id: pid, state: APP.engine.publicState() }); } catch (e) {}
+    replyTo(connOrId, { t: 'welcome', id: pid, state: APP.engine.publicState() });
     APP.engine.emit();
+    return;
+  }
+  if (data.t === 'sync') {
+    replyTo(connOrId, { t: 'state', state: APP.engine.publicState() });
+    if (APP.engine.stage === 'reveal') {
+      replyTo(connOrId, { t: 'reveal', books: bookDataForReveal(APP.engine) });
+    } else if (APP.engine.assignments && APP.engine.assignments[pid]) {
+      const turn = makeTurnForPlayer(APP.engine, pid);
+      if (turn) replyTo(connOrId, turn);
+    }
     return;
   }
   if (data.t === 'submit') {
@@ -1573,7 +1842,8 @@ function onPeerLeft (pid) {
   if (!APP.engine) return;
   APP.conns.delete(pid);
   const player = APP.engine.players.find(p => p.id === pid);
-  if (!player) return;
+  if (!player || player._gone) return;
+  player._gone = true;
   if (['lobby', 'reveal'].includes(APP.engine.stage)) {
     APP.engine.removePlayer(pid);
     APP.engine.emit();
@@ -1597,9 +1867,9 @@ function updateNetNote () {
   if (!el) return;
   el.className = 'net-note ' + (APP.netStatus === 'online' ? 'online' : APP.netStatus === 'offline' ? 'offline' : '');
   const dot = '<span class="nd"></span>';
-  const label = APP.netStatus === 'online' ? 'Modo online activo: comparte el código' :
-    APP.netStatus === 'offline' ? 'Modo local: online no disponible, usa bots' :
-    APP.netStatus === 'reconnecting' ? 'Reconectando la sala…' : 'Activando el modo online…';
+  const label = APP.netStatus === 'online' ? 'Sala online lista (v' + BUILD + '): comparte el código' :
+    APP.netStatus === 'offline' ? 'Online no disponible: recarga con Ctrl+F5 o usa bots' :
+    APP.netStatus === 'reconnecting' ? 'Reconectando la sala…' : 'Abriendo la sala online…';
   el.innerHTML = dot + esc(label);
 }
 
@@ -1607,36 +1877,153 @@ function updateNetNote () {
    ROOM: client
 ------------------------------------------------------------ */
 function connectAsClient (code, name) {
-  if (typeof Peer === 'undefined') {
-    modalError('No se pudo cargar el servicio multijugador. Revisa tu conexión o tu bloqueador de anuncios y recarga.');
+  const cleanCode = String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 5);
+  if (cleanCode.length < 4) {
+    modalError('Ese código no parece válido. Debe tener 5 caracteres.');
     return;
   }
   setModalBusy(true, 'Buscando sala…');
   APP.mode = 'client';
-  APP.me = { id: null, name: cleanName(name) || 'Artista', avatar: APP.selectedAvatar || savedAvatar() || pick(AVATARS), isHost: false };
-  let finished = false;
-
+  APP.roomCode = cleanCode;
+  APP.inviteCode = cleanCode;
+  APP.transport = null;
+  APP.me = {
+    id: 'c' + uid().replace(/[^a-z0-9]/gi, ''),
+    name: cleanName(name) || 'Artista',
+    avatar: APP.selectedAvatar || savedAvatar() || pick(AVATARS),
+    isHost: false
+  };
+  APP.joinToken = uid();
+  const token = APP.joinToken;
   const fail = (message) => {
-    if (finished) return;
-    finished = true;
-    if (APP.screen !== 'home') return;
+    if (APP.joinToken !== token || APP.screen !== 'home') return;
+    APP.joinToken = null;
+    clearTimeout(APP.helloTimer);
     setModalBusy(false);
     modalError(message);
+    stopNet(true);
     APP.mode = null;
-    if (APP.peer) { try { APP.peer.destroy(); } catch (e) {} APP.peer = null; }
-    APP.hostConn = null;
     APP.me = null;
+    APP.roomCode = '';
   };
-
-  const timeout = setTimeout(() => fail('La sala no responde. Comprueba el código y que el anfitrión siga conectado.'), 14000);
-
+  ensureMqtt((ok) => {
+    if (APP.joinToken !== token) return;
+    if (!ok) { startPeerClient(cleanCode, token, fail); return; }
+    tryClientBroker(cleanCode, 0, token, fail);
+  });
+}
+function tryClientBroker (code, index, token, fail) {
+  if (APP.joinToken !== token || !APP.me) return;
+  const broker = BROKERS[index];
+  if (!broker) { startPeerClient(code, token, fail); return; }
+  const client = openBroker(broker, 'gc' + code + Math.random().toString(36).slice(2, 8));
+  if (!client) { tryClientBroker(code, index + 1, token, fail); return; }
+  let settled = false;
+  const giveUp = setTimeout(() => {
+    if (settled || APP.joinToken !== token || APP.transport === 'mqtt') return;
+    stopSocket(client, true);
+    if (APP.mqtt === client) APP.mqtt = null;
+    tryClientBroker(code, index + 1, token, fail);
+  }, index === 0 ? 10000 : 6000);
+  const subscribe = () => {
+    if (!APP.me) return;
+    client.subscribe([
+      roomTopic(code, 'host'),
+      roomTopic(code, 'out', APP.me.id),
+      roomTopic(code, 'all')
+    ], { qos: 0 }, () => {
+      if (APP.transport === 'mqtt' && APP.screen !== 'home') sendToHost({ t: 'sync' });
+    });
+  };
+  client.on('connect', () => {
+    if (APP.joinToken !== token && !(APP.transport === 'mqtt' && APP.mqtt === client)) {
+      stopSocket(client, true);
+      return;
+    }
+    if (APP.transport === 'peer' || (APP.transport === 'mqtt' && APP.mqtt && APP.mqtt !== client)) {
+      stopSocket(client, true);
+      return;
+    }
+    subscribe();
+  });
+  client.on('message', (top, message) => {
+    if (APP.mqtt && APP.mqtt !== client && APP.transport === 'mqtt') return;
+    const topicName = String(top || '');
+    const text = bytesToText(message);
+    if (topicName.endsWith('/host')) {
+      ingestRaw(text, (msg) => {
+        if (!msg || msg.t !== 'presence') return;
+        if (msg.online && String(msg.code || code).toUpperCase() === code) {
+          clearTimeout(APP.hostGoneTimer);
+          if (APP.transport === 'mqtt') return;
+          if (settled || APP.joinToken !== token) return;
+          settled = true;
+          clearTimeout(giveUp);
+          APP.mqtt = client;
+          APP.broker = broker;
+          APP.transport = 'mqtt';
+          APP.netStatus = 'online';
+          sendHelloLoop(token, fail);
+        } else if (msg.online === false && APP.transport === 'mqtt' && APP.mqtt === client && APP.screen !== 'home') {
+          clearTimeout(APP.hostGoneTimer);
+          APP.hostGoneTimer = setTimeout(() => {
+            if (APP.mode === 'client' && APP.screen !== 'home') onHostLost();
+          }, 4500);
+        }
+      });
+      return;
+    }
+    ingestRaw(text, (msg) => {
+      if (APP.transport === 'mqtt' && APP.mqtt === client) handleClientData(msg);
+    });
+  });
+  client.on('error', (err) => console.warn('mqtt client', err && err.message ? err.message : err));
+}
+function sendHelloLoop (token, fail) {
+  const send = () => {
+    if (APP.joinToken !== token || !APP.me || !APP.roomCode) return;
+    publishJson(roomTopic(APP.roomCode, 'in', APP.me.id), {
+      t: 'hello', name: APP.me.name, avatar: APP.me.avatar
+    }, { qos: 1 });
+  };
+  send();
+  clearTimeout(APP.helloTimer);
+  let tries = 0;
+  const tick = () => {
+    if (APP.joinToken !== token) return;
+    tries++;
+    if (tries > 6) {
+      fail('Encontramos la sala, pero el anfitrión no responde. Pídele que recargue la página (v3) y cree la sala otra vez.');
+      return;
+    }
+    send();
+    APP.helloTimer = setTimeout(tick, 1800);
+  };
+  APP.helloTimer = setTimeout(tick, 1800);
+}
+function startPeerClient (code, token, fail) {
+  if (APP.joinToken !== token) return;
+  if (typeof Peer === 'undefined') {
+    fail('No se pudo contactar la sala. Recarga con Ctrl+F5, desactiva el bloqueador de anuncios y comprueba que ambos veáis «v3».');
+    return;
+  }
+  if (APP.mqtt) { stopSocket(APP.mqtt, true); APP.mqtt = null; }
+  setModalBusy(true, 'Probando conexión directa…');
+  let finished = false;
+  const localFail = (message) => {
+    if (finished || APP.joinToken !== token) return;
+    finished = true;
+    fail(message);
+  };
+  const timeout = setTimeout(() => localFail('No encontramos esa sala. Comprueba el código y que en la sala ponga «Sala online lista (v3)».'), 18000);
   try {
     const peer = new Peer(undefined, PEER_OPTIONS);
     APP.peer = peer;
+    APP.transport = 'peer';
     peer.on('open', (id) => {
-      if (finished || !APP.me) return;
+      if (APP.joinToken !== token || !APP.me) return;
       APP.me.id = id;
-      const conn = peer.connect(ROOM_PREFIX + code, { reliable: true, metadata: { name: APP.me.name } });
+      const conn = peer.connect(PEER_PREFIX + code, { reliable: true, metadata: { name: APP.me.name } });
       APP.hostConn = conn;
       conn.on('open', () => {
         clearTimeout(timeout);
@@ -1646,38 +2033,42 @@ function connectAsClient (code, name) {
       conn.on('data', handleClientData);
       conn.on('close', () => {
         clearTimeout(timeout);
-        if (APP.screen === 'home') { fail('No se pudo conectar con la sala. Puede que ya no exista.'); return; }
-        onHostLost();
+        if (APP.screen === 'home') localFail('La conexión con la sala se cortó. Inténtalo de nuevo.');
+        else onHostLost();
       });
-      conn.on('error', (e) => {
-        console.warn('conn error', e);
-        clearTimeout(timeout);
-        if (APP.screen === 'home') fail('No se pudo conectar con la sala. Revisa el código.');
+      conn.on('error', () => {
+        if (APP.screen === 'home') localFail('No se pudo conectar con la sala. Revisa el código.');
       });
     });
     peer.on('error', (err) => {
-      console.warn('PeerJS client error:', err && err.type, err);
-      if (finished) return;
       const type = err && err.type;
+      console.warn('peer client', type, err);
+      if (finished || APP.joinToken !== token) return;
       if (type === 'peer-unavailable') {
-        fail('No encontramos ninguna sala con ese código. Revísalo o pide un enlace nuevo.');
-      } else if (['network', 'server-error', 'socket-error'].includes(type)) {
-        fail('El servicio de emparejamiento no responde. Inténtalo de nuevo en unos segundos.');
-      } else if (type === 'unavailable-id') {
-        fail('No se pudo crear tu conexión. Recarga la página e inténtalo otra vez.');
+        clearTimeout(timeout);
+        localFail('No encontramos ninguna sala con ese código. El anfitrión debe seguir en la sala y ambos tenéis que ver v3.');
+      } else if (type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed') {
+        clearTimeout(timeout);
+        localFail('El servicio de salas no responde. Espera unos segundos y vuelve a intentarlo.');
+      } else if (type === 'webrtc' || type === 'negotiation-failed') {
+        clearTimeout(timeout);
+        localFail('La red bloqueó la conexión. Recargad los dos con Ctrl+F5: la versión v3 no depende de esa conexión.');
       }
     });
   } catch (e) {
     console.warn(e);
-    fail('No se pudo iniciar la conexión. Comprueba tu navegador e inténtalo de nuevo.');
+    localFail('No se pudo iniciar la conexión. Prueba con Chrome o Firefox actualizado.');
   }
 }
 
 function handleClientData (data) {
   if (!data || typeof data !== 'object' || !APP.me) return;
   if (data.t === 'welcome') {
+    APP.joinToken = null;
+    clearTimeout(APP.helloTimer);
     APP.joining = false;
-    $('#joinModal').classList.remove('open');
+    const modal = $('#joinModal');
+    if (modal) modal.classList.remove('open');
     if (data.id) APP.me.id = data.id;
     APP.screen = 'home';
     applyState(data.state);
@@ -1697,23 +2088,31 @@ function handleClientData (data) {
     return;
   }
   if (data.t === 'denied') {
-    APP.joining = false;
-    $('#modalSubmit').disabled = false;
-    APP.mode = null;
-    if (APP.peer) { try { APP.peer.destroy(); } catch (e) {} APP.peer = null; }
+    const reason = data.reason || 'No se pudo entrar en la sala.';
+    APP.joinToken = null;
+    clearTimeout(APP.helloTimer);
     if (APP.screen === 'home') {
       setModalBusy(false);
-      modalError(data.reason || 'La partida ya ha empezado. Espera a la siguiente.');
+      modalError(reason);
+      stopNet(true);
+      APP.mode = null;
+      APP.me = null;
     } else {
-      toast(data.reason || 'La partida ya ha empezado.', 4000);
-      goHome();
+      toast(reason, 4000);
+      onHostLost();
     }
     return;
   }
 }
 
 function sendToHost (msg) {
-  if (APP.mode !== 'client' || !APP.hostConn) return false;
+  if (APP.mode !== 'client' || !APP.me) return false;
+  if (APP.transport === 'mqtt') {
+    if (!APP.roomCode) return false;
+    publishJson(roomTopic(APP.roomCode, 'in', APP.me.id), msg, { qos: 0 });
+    return !!APP.mqtt;
+  }
+  if (!APP.hostConn) return false;
   try { if (APP.hostConn.open) { APP.hostConn.send(msg); return true; } } catch (e) {}
   return false;
 }
@@ -1726,29 +2125,31 @@ function onHostLost () {
 }
 
 function leaveRoom () {
-  if (APP.mode === 'client') {
-    sendToHost({ t: 'bye' });
-    try { if (APP.peer) APP.peer.destroy(); } catch (e) {}
-  } else if (APP.mode === 'host') {
+  if (APP.mode === 'client') sendToHost({ t: 'bye' });
+  else if (APP.mode === 'host') {
     broadcast({ t: 'denied', reason: 'El anfitrión ha cerrado la sala. ¡Gracias por jugar!' });
     broadcast({ t: 'state', state: { ...(APP.engine ? APP.engine.publicState() : {}), stage: 'closed' } });
-    try { if (APP.peer) APP.peer.destroy(); } catch (e) {}
+    publishPresence(false);
   }
+  flushNow();
+  const mqtt = APP.mqtt;
+  const peer = APP.peer;
+  APP.mqtt = null;
+  APP.peer = null;
   goHome();
+  setTimeout(() => { stopSocket(mqtt, false); stopSocket(peer, true); }, 250);
 }
 
 function goHome () {
   if (APP.engine) { clearEngineTimers(APP.engine); }
-  const oldPeer = APP.peer;
+  stopNet(true);
   APP.screen = 'home';
   APP.mode = null;
   APP.me = null;
   APP.state = null;
   APP.turn = null;
   APP.engine = null;
-  APP.peer = null;
   APP.conns.clear();
-  APP.hostConn = null;
   APP.revealBooks = null;
   APP.submitted = false;
   APP.draw = null;
@@ -1757,7 +2158,8 @@ function goHome () {
   APP.netStatus = 'idle';
   APP.joining = false;
   APP.inviteCode = '';
-  try { if (oldPeer && !oldPeer.destroyed) oldPeer.destroy(); } catch (e) {}
+  APP.roomCode = '';
+  APP.joinToken = null;
   const app = $('#app');
   app.innerHTML = APP.homeHTML || '';
   try { history.replaceState(null, '', location.pathname); } catch (e) {}
@@ -2185,8 +2587,10 @@ function tickTimer () {
    RENDER — sala de espera
    ============================================================ */
 function inviteUrl () {
-  const code = (APP.state && APP.state.code) || APP.inviteCode || '';
-  return location.origin + location.pathname + '?sala=' + code;
+  const code = (APP.state && APP.state.code) || APP.inviteCode || APP.roomCode || '';
+  let path = location.pathname || '/';
+  if (!path.endsWith('/') && !/index\.html$/i.test(path)) path += '/';
+  return location.origin + path + '?sala=' + encodeURIComponent(code);
 }
 
 function copyText (text, okMessage) {
@@ -2380,7 +2784,13 @@ function applyState (st) {
   if (st.stage === 'reveal') {
     APP.screen = 'reveal';
     if (APP.revealBooks) renderReveal();
-    else showLoadingScreen('Preparando los álbumes', 'Recopilando frases, dibujos y desastres…');
+    else {
+      showLoadingScreen('Preparando los álbumes', 'Recopilando frases, dibujos y desastres…');
+      if (APP.mode === 'client') {
+        clearTimeout(APP.revealAsk);
+        APP.revealAsk = setTimeout(() => { if (!APP.revealBooks) sendToHost({ t: 'sync' }); }, 900);
+      }
+    }
     return;
   }
   const phaseChanged = APP.screen !== 'game' || !prev || prev.phase !== st.phase || prev.stage !== st.stage;
@@ -2490,6 +2900,14 @@ function renderGameView () {
   APP.turnRenderedPhase = APP.turn && APP.turn.phase === st.phase ? st.phase : -1;
   renderTurnBody();
   updateGameChrome();
+  if (APP.mode === 'client' && (st.stage === 'draw' || st.stage === 'guess')) {
+    const turn = APP.turn;
+    const missing = !turn || Number(turn.phase) !== Number(st.phase) || !turn.payload;
+    if (missing) {
+      clearTimeout(APP.turnAsk);
+      APP.turnAsk = setTimeout(() => sendToHost({ t: 'sync' }), 800);
+    }
+  }
 }
 
 function renderTurnBody () {
@@ -3379,7 +3797,11 @@ function init () {
     setTimeout(() => toast('Parece que no hay conexión. Podrás jugar con bots, pero el online necesita internet.', 4200), 900);
   }
   window.addEventListener('beforeunload', () => {
-    if (APP.mode === 'client' && APP.hostConn) { try { APP.hostConn.send({ t: 'bye' }); } catch (e) {} }
+    try {
+      if (APP.mode === 'client') sendToHost({ t: 'bye' });
+      if (APP.mode === 'host') publishPresence(false);
+      flushNow();
+    } catch (e) {}
   });
 }
 
